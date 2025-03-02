@@ -97,6 +97,8 @@ const char kLoadingErr[] = "-LOADING Dragonfly is loading the dataset in memory"
 const char kUndeclaredKeyErr[] = "script tried accessing undeclared key";
 const char kInvalidDumpValueErr[] = "DUMP payload version or checksum are wrong";
 const char kInvalidJsonPathErr[] = "invalid JSON path";
+const char kJsonParseError[] = "failed to parse JSON";
+const char kCrossSlotError[] = "-CROSSSLOT Keys in request don't hash to the same slot";
 
 const char kSyntaxErrType[] = "syntax_error";
 const char kScriptErrType[] = "script_error";
@@ -136,7 +138,9 @@ CommandId::CommandId(const char* name, uint32_t mask, int8_t arity, int8_t first
   if (name_ == "PUBLISH" || name_ == "SUBSCRIBE" || name_ == "UNSUBSCRIBE") {
     is_pub_sub_ = true;
   } else if (name_ == "PSUBSCRIBE" || name_ == "PUNSUBSCRIBE") {
-    is_p_sub_ = true;
+    is_p_pub_sub_ = true;
+  } else if (name_ == "SPUBLISH" || name_ == "SSUBSCRIBE" || name_ == "SUNSUBSCRIBE") {
+    is_sharded_pub_sub_ = true;
   }
 }
 

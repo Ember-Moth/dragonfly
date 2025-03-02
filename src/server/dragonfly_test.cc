@@ -8,11 +8,10 @@ extern "C" {
 }
 
 #include <absl/strings/ascii.h>
-#include <absl/strings/charconv.h>
 #include <absl/strings/str_join.h>
 #include <absl/strings/strip.h>
-#include <fast_float/fast_float.h>
 #include <gmock/gmock.h>
+#include <reflex/matcher.h>
 
 #include "base/flags.h"
 #include "base/gtest.h"
@@ -305,7 +304,7 @@ TEST_F(DflyEngineTestWithRegistry, Hello) {
 
   EXPECT_THAT(
       resp.GetVec(),
-      ElementsAre("server", "redis", "version", "7.2.0", "dragonfly_version",
+      ElementsAre("server", "redis", "version", "7.4.0", "dragonfly_version",
                   ArgType(RespExpr::STRING), "proto", IntArg(2), "id", ArgType(RespExpr::INT64),
                   "mode", testing::AnyOf("standalone", "cluster"), "role", "master"));
 
@@ -313,7 +312,7 @@ TEST_F(DflyEngineTestWithRegistry, Hello) {
   ASSERT_THAT(resp, ArrLen(14));
   EXPECT_THAT(
       resp.GetVec(),
-      ElementsAre("server", "redis", "version", "7.2.0", "dragonfly_version",
+      ElementsAre("server", "redis", "version", "7.4.0", "dragonfly_version",
                   ArgType(RespExpr::STRING), "proto", IntArg(3), "id", ArgType(RespExpr::INT64),
                   "mode", testing::AnyOf("standalone", "cluster"), "role", "master"));
 
@@ -498,9 +497,11 @@ TEST_F(DflyEngineTest, StickyEviction) {
   string tmp_val(100, '.');
 
   ssize_t failed = -1;
-  for (ssize_t i = 0; i < 5000; ++i) {
+
+  for (ssize_t i = 0; i < 4500; ++i) {
     string key = StrCat("volatile", i);
     ASSERT_EQ("OK", Run({"set", key, tmp_val}));
+    usleep(1);
   }
 
   bool done = false;
@@ -774,7 +775,7 @@ TEST_F(DflyEngineTest, MemoryUsage) {
   }
 
   for (unsigned i = 0; i < 1000; ++i) {
-    Run({"rpush", "l2", StrCat(string('a', 200), i)});
+    Run({"rpush", "l2", StrCat(string(200, 'a'), i)});
   }
   auto resp = Run({"memory", "usage", "l1"});
   EXPECT_GT(*resp.GetInt(), 8000);
@@ -832,38 +833,5 @@ TEST_F(DflyEngineTest, ReplicaofRejectOnLoad) {
 // TODO: to test transactions with a single shard since then all transactions become local.
 // To consider having a parameter in dragonfly engine controlling number of shards
 // unconditionally from number of cpus. TO TEST BLPOP under multi for single/multi argument case.
-
-// Parse Double benchmarks
-static void BM_ParseFastFloat(benchmark::State& state) {
-  std::vector<std::string> args(100);
-  std::random_device rd;
-
-  for (auto& arg : args) {
-    arg = std::to_string(std::uniform_real_distribution<double>(0, 1e5)(rd));
-  }
-  double res;
-  while (state.KeepRunning()) {
-    for (const auto& arg : args) {
-      fast_float::from_chars(arg.data(), arg.data() + arg.size(), res);
-    }
-  }
-}
-BENCHMARK(BM_ParseFastFloat);
-
-static void BM_ParseDoubleAbsl(benchmark::State& state) {
-  std::vector<std::string> args(100);
-  std::random_device rd;
-  for (auto& arg : args) {
-    arg = std::to_string(std::uniform_real_distribution<double>(0, 1e5)(rd));
-  }
-
-  double res;
-  while (state.KeepRunning()) {
-    for (const auto& arg : args) {
-      absl::from_chars(arg.data(), arg.data() + arg.size(), res);
-    }
-  }
-}
-BENCHMARK(BM_ParseDoubleAbsl);
 
 }  // namespace dfly

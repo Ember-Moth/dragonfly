@@ -1014,7 +1014,7 @@ void StringFamily::Set(CmdArgList args, const CommandContext& cmnd_cntx) {
       if (rel_ms < 0) {
         cmnd_cntx.tx->ScheduleSingleHop([](const Transaction* tx, EngineShard* es) {
           ShardArgs args = tx->GetShardArgs(es->shard_id());
-          GenericFamily::OpDel(tx->GetOpArgs(es), args);
+          GenericFamily::OpDel(tx->GetOpArgs(es), args, false);
           return OpStatus::OK;
         });
         return builder->SendStored();
@@ -1453,7 +1453,7 @@ void StringFamily::GetRange(CmdArgList args, const CommandContext& cmnd_cntx) {
     return cmnd_cntx.rb->SendError(err->MakeReply());
   }
 
-  auto cb = [&](Transaction* t, EngineShard* shard) {
+  auto cb = [&, &key = key, &start = start, &end = end](Transaction* t, EngineShard* shard) {
     return OpGetRange(t->GetOpArgs(shard), key, start, end);
   };
 
@@ -1477,7 +1477,7 @@ void StringFamily::SetRange(CmdArgList args, const CommandContext& cmnd_cntx) {
     return builder->SendError("string exceeds maximum allowed size");
   }
 
-  auto cb = [&](Transaction* t, EngineShard* shard) {
+  auto cb = [&, &key = key, &start = start, &value = value](Transaction* t, EngineShard* shard) {
     return OpSetRange(t->GetOpArgs(shard), key, start, value);
   };
   auto res = cmnd_cntx.tx->ScheduleSingleHopT(cb);

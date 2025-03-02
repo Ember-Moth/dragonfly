@@ -51,6 +51,30 @@ bool StringSet::Add(string_view src, uint32_t ttl_sec) {
   return true;
 }
 
+unsigned StringSet::AddMany(absl::Span<std::string_view> span, uint32_t ttl_sec) {
+  std::string_view views[kMaxBatchLen];
+  unsigned res = 0;
+  if (BucketCount() < span.size()) {
+    Reserve(span.size());
+  }
+
+  while (span.size() >= kMaxBatchLen) {
+    for (size_t i = 0; i < kMaxBatchLen; i++)
+      views[i] = span[i];
+
+    span.remove_prefix(kMaxBatchLen);
+    res += AddBatch(absl::MakeSpan(views), ttl_sec);
+  }
+
+  if (span.size()) {
+    for (size_t i = 0; i < span.size(); i++)
+      views[i] = span[i];
+
+    res += AddBatch(absl::MakeSpan(views, span.size()), ttl_sec);
+  }
+  return res;
+}
+
 unsigned StringSet::AddBatch(absl::Span<std::string_view> span, uint32_t ttl_sec) {
   uint64_t hash[kMaxBatchLen];
   bool has_ttl = ttl_sec != UINT32_MAX;
@@ -163,6 +187,46 @@ sds StringSet::MakeSetSds(string_view src, uint32_t ttl_sec) const {
   }
 
   return sdsnewlen(src.data(), src.size());
+}
+
+// Does not release obj. Callers must deallocate with sdsfree explicitly
+pair<sds, bool> StringSet::DuplicateEntryIfFragmented(void* obj, float ratio) {
+  sds key = (sds)obj;
+
+  if (!zmalloc_page_is_underutilized(key, ratio))
+    return {key, false};
+
+  size_t key_len = sdslen(key);
+  bool has_ttl = MayHaveTtl(key);
+
+  if (has_ttl) {
+    sds res = AllocSdsWithSpace(key_len, sizeof(uint32_t));
+    std::memcpy(res, key, key_len + sizeof(uint32_t));
+    return {res, true};
+  }
+
+  return {sdsnewlen(key, key_len), true};
+}
+
+bool StringSet::iterator::ReallocIfNeeded(float ratio) {
+  auto* ptr = curr_entry_;
+  if (ptr->IsLink()) {
+    ptr = ptr->AsLink();
+  }
+
+  DCHECK(!ptr->IsEmpty());
+  DCHECK(ptr->IsObject());
+
+  auto* obj = ptr->GetObject();
+  auto [new_obj, realloced] =
+      static_cast<StringSet*>(owner_)->DuplicateEntryIfFragmented(obj, ratio);
+
+  if (realloced) {
+    ptr->SetObject(new_obj);
+    sdsfree((sds)obj);
+  }
+
+  return realloced;
 }
 
 }  // namespace dfly

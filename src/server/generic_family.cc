@@ -12,7 +12,6 @@
 
 extern "C" {
 #include "redis/crc64.h"
-#include "redis/util.h"
 }
 
 #include "base/flags.h"
@@ -37,6 +36,7 @@ extern "C" {
 
 ABSL_FLAG(uint32_t, dbnum, 16, "Number of databases");
 ABSL_FLAG(uint32_t, keys_output_limit, 8192, "Maximum number of keys output by keys command");
+ABSL_FLAG(bool, unlink_experimental_async, true, "If true, runs unlink command asynchronously.");
 
 namespace dfly {
 using namespace std;
@@ -107,9 +107,9 @@ class InMemSource : public ::io::Source {
 
 class RestoreArgs {
  private:
-  static constexpr time_t NO_EXPIRATION = 0;
+  static constexpr int64_t NO_EXPIRATION = 0;
 
-  time_t expiration_ = NO_EXPIRATION;
+  int64_t expiration_ = NO_EXPIRATION;
   bool abs_time_ = false;
   bool replace_ = false;  // if true, over-ride existing key
   bool sticky_ = false;
@@ -117,7 +117,7 @@ class RestoreArgs {
  public:
   RestoreArgs() = default;
 
-  RestoreArgs(time_t expiration, bool abs_time, bool replace)
+  RestoreArgs(int64_t expiration, bool abs_time, bool replace)
       : expiration_(expiration), abs_time_(abs_time), replace_(replace) {
   }
 
@@ -212,6 +212,7 @@ OpResult<DbSlice::AddOrFindResult> RdbRestoreValue::Add(string_view key, string_
     if (pending_read_.remaining > 0) {
       config.streamed = true;
     }
+    config.reserve = pending_read_.reserve;
 
     if (auto ec = FromOpaque(*opaque_res, config, &pv); ec) {
       // we failed - report and exit
@@ -232,7 +233,7 @@ OpResult<DbSlice::AddOrFindResult> RdbRestoreValue::Add(string_view key, string_
   if (HasExpiration()) {
     int64_t ttl = abs_time_ ? expiration_ - now_msec : expiration_;
     if (ttl > kMaxExpireDeadlineMs)
-      return false;
+      ttl = kMaxExpireDeadlineMs;
 
     expiration_ = ttl < 0 ? -1 : ttl + now_msec;
   }
@@ -322,7 +323,7 @@ class Renamer {
   struct SerializedValue {
     std::string value;
     std::optional<RdbVersion> version;
-    time_t expire_ts;
+    int64_t expire_ts;
     bool sticky;
   };
 
@@ -575,17 +576,15 @@ OpStatus OpRestore(const OpArgs& op_args, std::string_view key, std::string_view
   return add_res.status();
 }
 
-bool ScanCb(const OpArgs& op_args, PrimeIterator prime_it, const ScanOpts& opts, string* scratch,
-            StringVec* res) {
+bool ScanCb(const OpArgs& op_args, PrimeIterator prime_it, const ScanOpts& opts, StringVec* res) {
   auto& db_slice = op_args.GetDbSlice();
 
   DbSlice::Iterator it = DbSlice::Iterator::FromPrime(prime_it);
   if (prime_it->second.HasExpire()) {
     it = db_slice.ExpireIfNeeded(op_args.db_cntx, it).it;
+    if (!IsValid(it))
+      return false;
   }
-
-  if (!IsValid(it))
-    return false;
 
   bool matches = !opts.type_filter || it->second.ObjType() == opts.type_filter;
 
@@ -596,11 +595,10 @@ bool ScanCb(const OpArgs& op_args, PrimeIterator prime_it, const ScanOpts& opts,
     return false;
   }
 
-  it->first.GetString(scratch);
-  if (!opts.Matches(*scratch)) {
+  if (!opts.Matches(it.key())) {
     return false;
   }
-  res->push_back(*scratch);
+  res->push_back(string(it.key()));
 
   return true;
 }
@@ -615,7 +613,6 @@ void OpScan(const OpArgs& op_args, const ScanOpts& scan_opts, uint64_t* cursor, 
   db_slice.BlockingCounter()->Wait();
   // Disable flush journal changes to prevent preemtion in traverse.
   journal::JournalFlushGuard journal_flush_guard(op_args.shard->journal());
-  util::FiberAtomicGuard guard;
   unsigned cnt = 0;
 
   VLOG(1) << "PrimeTable " << db_slice.shard_id() << "/" << op_args.db_cntx.db_index << " has "
@@ -623,11 +620,14 @@ void OpScan(const OpArgs& op_args, const ScanOpts& scan_opts, uint64_t* cursor, 
 
   PrimeTable::Cursor cur = *cursor;
   auto [prime_table, expire_table] = db_slice.GetTables(op_args.db_cntx.db_index);
-  string scratch;
+
+  size_t buckets_iterated = 0;
+  // 10k Traverses
+  const size_t limit = 10000;
   do {
     cur = prime_table->Traverse(
-        cur, [&](PrimeIterator it) { cnt += ScanCb(op_args, it, scan_opts, &scratch, vec); });
-  } while (cur && cnt < scan_opts.limit);
+        cur, [&](PrimeIterator it) { cnt += ScanCb(op_args, it, scan_opts, vec); });
+  } while (cur && cnt < scan_opts.limit && buckets_iterated++ < limit);
 
   VLOG(1) << "OpScan " << db_slice.shard_id() << " cursor: " << cur.value();
   *cursor = cur.value();
@@ -994,14 +994,14 @@ std::optional<int32_t> ParseExpireOptionsOrReply(const CmdArgList args, SinkRepl
   return flags;
 }
 
-void DeleteGeneric(CmdArgList args, const CommandContext& cmd_cntx) {
+void DeleteGeneric(CmdArgList args, const CommandContext& cmd_cntx, bool async) {
   atomic_uint32_t result{0};
   auto* builder = cmd_cntx.rb;
   bool is_mc = (builder->GetProtocol() == Protocol::MEMCACHE);
 
-  auto cb = [&result](const Transaction* t, EngineShard* shard) {
+  auto cb = [&](const Transaction* t, EngineShard* shard) {
     ShardArgs args = t->GetShardArgs(shard->shard_id());
-    auto res = GenericFamily::OpDel(t->GetOpArgs(shard), args);
+    auto res = GenericFamily::OpDel(t->GetOpArgs(shard), args, async);
     result.fetch_add(res.value_or(0), memory_order_relaxed);
 
     return OpStatus::OK;
@@ -1029,8 +1029,8 @@ void DeleteGeneric(CmdArgList args, const CommandContext& cmd_cntx) {
 
 }  // namespace
 
-OpResult<uint32_t> GenericFamily::OpDel(const OpArgs& op_args, const ShardArgs& keys) {
-  DVLOG(1) << "Del: " << keys.Front();
+OpResult<uint32_t> GenericFamily::OpDel(const OpArgs& op_args, const ShardArgs& keys, bool async) {
+  DVLOG(1) << "Del: " << keys.Front() << " async: " << async;
   auto& db_slice = op_args.GetDbSlice();
 
   uint32_t res = 0;
@@ -1040,6 +1040,9 @@ OpResult<uint32_t> GenericFamily::OpDel(const OpArgs& op_args, const ShardArgs& 
     if (!IsValid(it))
       continue;
 
+    if (async)
+      it->first.SetAsyncDelete();
+
     db_slice.Del(op_args.db_cntx, it);
     ++res;
   }
@@ -1048,13 +1051,12 @@ OpResult<uint32_t> GenericFamily::OpDel(const OpArgs& op_args, const ShardArgs& 
 }
 
 void GenericFamily::Del(CmdArgList args, const CommandContext& cmd_cntx) {
-  VLOG(1) << "Del " << ArgS(args, 0);
-
-  DeleteGeneric(args, cmd_cntx);
+  DeleteGeneric(args, cmd_cntx, false);
 }
 
 void GenericFamily::Unlink(CmdArgList args, const CommandContext& cmd_cntx) {
-  DeleteGeneric(args, cmd_cntx);
+  bool async = absl::GetFlag(FLAGS_unlink_experimental_async);
+  DeleteGeneric(args, cmd_cntx, async);
 }
 
 void GenericFamily::Ping(CmdArgList args, const CommandContext& cmd_cntx) {
@@ -1180,7 +1182,7 @@ void GenericFamily::Keys(CmdArgList args, const CommandContext& cmd_cntx) {
 
   ScanOpts scan_opts;
   if (pattern != "*") {
-    scan_opts.pattern = pattern;
+    scan_opts.matcher.reset(new GlobMatcher{pattern, true});
   }
 
   scan_opts.limit = 512;
@@ -1509,7 +1511,7 @@ void GenericFamily::Restore(CmdArgList args, const CommandContext& cmd_cntx) {
     case OpStatus::OK:
       return builder->SendOk();
     case OpStatus::KEY_EXISTS:
-      return builder->SendError("BUSYKEY Target key name already exists.");
+      return builder->SendError("-BUSYKEY Target key name already exists.");
     case OpStatus::INVALID_VALUE:
       return builder->SendError("Bad data format");
     default:
@@ -1746,7 +1748,7 @@ void GenericFamily::Scan(CmdArgList args, const CommandContext& cmd_cntx) {
     return builder->SendError(ops.status());
   }
 
-  ScanOpts scan_op = ops.value();
+  const ScanOpts& scan_op = ops.value();
 
   StringVec keys;
   cursor = ScanGeneric(cursor, scan_op, &keys, cmd_cntx.conn_cntx);

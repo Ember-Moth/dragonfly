@@ -9,6 +9,7 @@
 #include <absl/strings/str_cat.h>
 #include <mimalloc.h>
 
+#include <chrono>
 #include <numeric>
 #include <variant>
 
@@ -78,6 +79,10 @@ ABSL_FLAG(uint32_t, max_multi_bulk_len, 1u << 16,
           "Maximum multi-bulk (array) length that is "
           "allowed to be accepted when parsing RESP protocol");
 
+ABSL_FLAG(uint64_t, max_bulk_len, 2u << 30,
+          "Maximum bulk length that is "
+          "allowed to be accepted when parsing RESP protocol");
+
 ABSL_FLAG(size_t, max_client_iobuf_len, 1u << 16,
           "Maximum io buffer length that is used to read client requests.");
 
@@ -92,6 +97,7 @@ using absl::GetFlag;
 using nonstd::make_unexpected;
 
 namespace facade {
+
 namespace {
 
 void SendProtocolError(RedisParser::Result pres, SinkReplyBuilder* builder) {
@@ -264,16 +270,15 @@ void LogTraffic(uint32_t id, bool has_more, absl::Span<RespExpr> resp,
 
 constexpr size_t kMinReadSize = 256;
 
-thread_local uint32_t free_req_release_weight = 0;
-
 const char* kPhaseName[Connection::NUM_PHASES] = {"SETUP", "READ", "PROCESS", "SHUTTING_DOWN",
                                                   "PRECLOSE"};
 
-}  // namespace
-
 // Keeps track of total per-thread sizes of dispatch queues to limit memory taken up by messages
 // in these queues.
-struct Connection::QueueBackpressure {
+struct QueueBackpressure {
+  QueueBackpressure() {
+  }
+
   // Block until subscriber memory usage is below limit, can be called from any thread.
   void EnsureBelowLimit();
 
@@ -296,13 +301,50 @@ struct Connection::QueueBackpressure {
   uint32_t pipeline_queue_max_len = 256;  // cached flag for pipeline queue max length.
 };
 
-thread_local vector<Connection::PipelineMessagePtr> Connection::pipeline_req_pool_;
-thread_local Connection::QueueBackpressure Connection::tl_queue_backpressure_;
-
-void Connection::QueueBackpressure::EnsureBelowLimit() {
+void QueueBackpressure::EnsureBelowLimit() {
   pubsub_ec.await(
       [this] { return subscriber_bytes.load(memory_order_relaxed) <= publish_buffer_limit; });
 }
+
+// Global array for each io thread to keep track of the total memory usage of the dispatch queues.
+QueueBackpressure* thread_queue_backpressure = nullptr;
+
+QueueBackpressure& GetQueueBackpressure() {
+  DCHECK(thread_queue_backpressure != nullptr);
+  return *thread_queue_backpressure;
+}
+
+}  // namespace
+
+thread_local vector<Connection::PipelineMessagePtr> Connection::pipeline_req_pool_;
+
+class PipelineCacheSizeTracker {
+ public:
+  bool CheckAndUpdateWatermark(size_t pipeline_sz) {
+    const auto now = Clock::now();
+    const auto elapsed = now - last_check_;
+    min_ = std::min(min_, pipeline_sz);
+    if (elapsed < std::chrono::milliseconds(10)) {
+      return false;
+    }
+
+    const bool watermark_reached = (min_ > 0);
+    min_ = Limits::max();
+    last_check_ = Clock::now();
+
+    return watermark_reached;
+  }
+
+ private:
+  using Tp = std::chrono::time_point<std::chrono::system_clock>;
+  using Clock = std::chrono::system_clock;
+  using Limits = std::numeric_limits<size_t>;
+
+  Tp last_check_ = Clock::now();
+  size_t min_ = Limits::max();
+};
+
+thread_local PipelineCacheSizeTracker tl_pipe_cache_sz_tracker;
 
 void Connection::PipelineMessage::SetArgs(const RespVec& args) {
   auto* next = storage.data();
@@ -456,6 +498,17 @@ void Connection::AsyncOperations::operator()(const AclUpdateMessage& msg) {
 
 void Connection::AsyncOperations::operator()(const PubMessage& pub_msg) {
   RedisReplyBuilder* rbuilder = (RedisReplyBuilder*)builder;
+
+  if (pub_msg.should_unsubscribe) {
+    rbuilder->StartCollection(3, RedisReplyBuilder::CollectionType::PUSH);
+    rbuilder->SendBulkString("unsubscribe");
+    rbuilder->SendBulkString(pub_msg.channel);
+    rbuilder->SendLong(0);
+    auto* cntx = self->cntx();
+    cntx->Unsubscribe(pub_msg.channel);
+    return;
+  }
+
   unsigned i = 0;
   array<string_view, 4> arr;
   if (pub_msg.pattern.empty()) {
@@ -464,8 +517,10 @@ void Connection::AsyncOperations::operator()(const PubMessage& pub_msg) {
     arr[i++] = "pmessage";
     arr[i++] = pub_msg.pattern;
   }
+
   arr[i++] = pub_msg.channel;
   arr[i++] = pub_msg.message;
+
   rbuilder->SendBulkStrArr(absl::Span<string_view>{arr.data(), i},
                            RedisReplyBuilder::CollectionType::PUSH);
 }
@@ -523,6 +578,30 @@ void UpdateLibNameVerMap(const string& name, const string& ver, int delta) {
 }
 }  // namespace
 
+void Connection::Init(unsigned io_threads) {
+  CHECK(thread_queue_backpressure == nullptr);
+  thread_queue_backpressure = new QueueBackpressure[io_threads];
+
+  for (unsigned i = 0; i < io_threads; ++i) {
+    auto& qbp = thread_queue_backpressure[i];
+    qbp.publish_buffer_limit = GetFlag(FLAGS_publish_buffer_limit);
+    qbp.pipeline_cache_limit = GetFlag(FLAGS_request_cache_limit);
+    qbp.pipeline_buffer_limit = GetFlag(FLAGS_pipeline_buffer_limit);
+    qbp.pipeline_queue_max_len = GetFlag(FLAGS_pipeline_queue_limit);
+
+    if (qbp.publish_buffer_limit == 0 || qbp.pipeline_cache_limit == 0 ||
+        qbp.pipeline_buffer_limit == 0 || qbp.pipeline_queue_max_len == 0) {
+      LOG(ERROR) << "pipeline flag limit is 0";
+      exit(-1);
+    }
+  }
+}
+
+void Connection::Shutdown() {
+  delete[] thread_queue_backpressure;
+  thread_queue_backpressure = nullptr;
+}
+
 Connection::Connection(Protocol protocol, util::HttpListenerBase* http_listener, SSL_CTX* ctx,
                        ServiceInterface* service)
     : io_buf_(kMinReadSize),
@@ -538,7 +617,9 @@ Connection::Connection(Protocol protocol, util::HttpListenerBase* http_listener,
 
   switch (protocol) {
     case Protocol::REDIS:
-      redis_parser_.reset(new RedisParser(GetFlag(FLAGS_max_multi_bulk_len)));
+      redis_parser_.reset(new RedisParser(RedisParser::Mode::SERVER,
+                                          GetFlag(FLAGS_max_multi_bulk_len),
+                                          GetFlag(FLAGS_max_bulk_len)));
       break;
     case Protocol::MEMCACHE:
       memcache_parser_.reset(new MemcacheParser);
@@ -572,6 +653,10 @@ Connection::~Connection() {
 #endif
 
   UpdateLibNameVerMap(lib_name_, lib_ver_, -1);
+}
+
+bool Connection::IsSending() const {
+  return reply_builder_ && reply_builder_->IsSendActive();
 }
 
 // Called from Connection::Shutdown() right after socket_->Shutdown call.
@@ -611,37 +696,14 @@ void Connection::OnPostMigrateThread() {
     LaunchAsyncFiberIfNeeded();
   }
 
-  // Update tl variables
-  queue_backpressure_ = &tl_queue_backpressure_;
-
   stats_ = &tl_facade_stats->conn_stats;
   ++stats_->num_conns;
   stats_->read_buf_capacity += io_buf_.Capacity();
 }
 
 void Connection::OnConnectionStart() {
-  DCHECK(queue_backpressure_ == nullptr);
-
   ThisFiber::SetName("DflyConnection");
 
-  // We must initialize tl_queue_backpressure_ here and not in the c'tor because a connection object
-  // may be created in a differrent thread from where it runs.
-  if (tl_queue_backpressure_.publish_buffer_limit == 0) {
-    tl_queue_backpressure_.publish_buffer_limit = GetFlag(FLAGS_publish_buffer_limit);
-    tl_queue_backpressure_.pipeline_cache_limit = GetFlag(FLAGS_request_cache_limit);
-    tl_queue_backpressure_.pipeline_buffer_limit = GetFlag(FLAGS_pipeline_buffer_limit);
-    tl_queue_backpressure_.pipeline_queue_max_len = GetFlag(FLAGS_pipeline_queue_limit);
-
-    if (tl_queue_backpressure_.publish_buffer_limit == 0 ||
-        tl_queue_backpressure_.pipeline_cache_limit == 0 ||
-        tl_queue_backpressure_.pipeline_buffer_limit == 0 ||
-        tl_queue_backpressure_.pipeline_queue_max_len == 0) {
-      LOG(ERROR) << "pipeline flag limit is 0";
-      exit(-1);
-    }
-  }
-
-  queue_backpressure_ = &tl_queue_backpressure_;
   stats_ = &tl_facade_stats->conn_stats;
 }
 
@@ -1016,19 +1078,18 @@ void Connection::ConnectionFlow() {
 
 void Connection::DispatchSingle(bool has_more, absl::FunctionRef<void()> invoke_cb,
                                 absl::FunctionRef<MessageHandle()> cmd_msg_cb) {
-  DCHECK(queue_backpressure_ == &tl_queue_backpressure_);
   bool optimize_for_async = has_more;
-
-  if (optimize_for_async && queue_backpressure_->IsPipelineBufferOverLimit(
-                                stats_->dispatch_queue_bytes, dispatch_q_.size())) {
+  QueueBackpressure& qbp = GetQueueBackpressure();
+  if (optimize_for_async &&
+      qbp.IsPipelineBufferOverLimit(stats_->dispatch_queue_bytes, dispatch_q_.size())) {
     stats_->pipeline_throttle_count++;
     LOG_EVERY_T(WARNING, 10) << "Pipeline buffer over limit: pipeline_bytes "
                              << stats_->dispatch_queue_bytes << " queue_size " << dispatch_q_.size()
                              << ", consider increasing pipeline_buffer_limit/pipeline_queue_limit";
     fb2::NoOpLock noop;
-    queue_backpressure_->pipeline_cnd.wait(noop, [this] {
-      bool over_limits = queue_backpressure_->IsPipelineBufferOverLimit(
-          stats_->dispatch_queue_bytes, dispatch_q_.size());
+    qbp.pipeline_cnd.wait(noop, [this, &qbp] {
+      bool over_limits =
+          qbp.IsPipelineBufferOverLimit(stats_->dispatch_queue_bytes, dispatch_q_.size());
       return !over_limits || (dispatch_q_.empty() && !cc_->async_dispatch) || cc_->conn_closing;
     });
     if (cc_->conn_closing)
@@ -1418,8 +1479,9 @@ void Connection::ClearPipelinedMessages() {
   }
 
   dispatch_q_.clear();
-  queue_backpressure_->pipeline_cnd.notify_all();
-  queue_backpressure_->pubsub_ec.notifyAll();
+  QueueBackpressure& qbp = GetQueueBackpressure();
+  qbp.pipeline_cnd.notify_all();
+  qbp.pubsub_ec.notifyAll();
 }
 
 string Connection::DebugInfo() const {
@@ -1465,7 +1527,7 @@ void Connection::AsyncFiber() {
 
   uint64_t prev_epoch = fb2::FiberSwitchEpoch();
   fb2::NoOpLock noop_lk;
-
+  QueueBackpressure& qbp = GetQueueBackpressure();
   while (!reply_builder_->GetError()) {
     DCHECK_EQ(socket()->proactor(), ProactorBase::me());
     cnd_.wait(noop_lk, [this] {
@@ -1493,7 +1555,7 @@ void Connection::AsyncFiber() {
     reply_builder_->SetBatchMode(dispatch_q_.size() > 1);
 
     bool subscriber_over_limit =
-        stats_->dispatch_queue_subscriber_bytes >= queue_backpressure_->publish_buffer_limit;
+        stats_->dispatch_queue_subscriber_bytes >= qbp.publish_buffer_limit;
 
     // Special case: if the dispatch queue accumulated a big number of commands,
     // we can try to squash them
@@ -1518,7 +1580,7 @@ void Connection::AsyncFiber() {
       if (ShouldEndAsyncFiber(msg)) {
         RecycleMessage(std::move(msg));
         CHECK(dispatch_q_.empty()) << DebugInfo();
-        queue_backpressure_->pipeline_cnd.notify_all();
+        qbp.pipeline_cnd.notify_all();
         return;  // don't set conn closing flag
       }
 
@@ -1528,21 +1590,18 @@ void Connection::AsyncFiber() {
       RecycleMessage(std::move(msg));
     }
 
-    DCHECK(queue_backpressure_ == &tl_queue_backpressure_);
-    if (!queue_backpressure_->IsPipelineBufferOverLimit(stats_->dispatch_queue_bytes,
-                                                        dispatch_q_.size()) ||
+    if (!qbp.IsPipelineBufferOverLimit(stats_->dispatch_queue_bytes, dispatch_q_.size()) ||
         dispatch_q_.empty()) {
-      queue_backpressure_->pipeline_cnd.notify_all();  // very cheap if noone is waiting on it.
+      qbp.pipeline_cnd.notify_all();  // very cheap if noone is waiting on it.
     }
 
-    if (subscriber_over_limit &&
-        stats_->dispatch_queue_subscriber_bytes < queue_backpressure_->publish_buffer_limit)
-      queue_backpressure_->pubsub_ec.notify();
+    if (subscriber_over_limit && stats_->dispatch_queue_subscriber_bytes < qbp.publish_buffer_limit)
+      qbp.pubsub_ec.notify();
   }
 
   DCHECK(cc_->conn_closing || reply_builder_->GetError());
   cc_->conn_closing = true;
-  queue_backpressure_->pipeline_cnd.notify_all();
+  qbp.pipeline_cnd.notify_all();
 }
 
 Connection::PipelineMessagePtr Connection::FromArgs(RespVec args, mi_heap_t* heap) {
@@ -1575,14 +1634,7 @@ void Connection::ShrinkPipelinePool() {
   if (pipeline_req_pool_.empty())
     return;
 
-  // The request pool is shared by all the connections in the thread so we do not want
-  // to release it aggressively just because some connection is running in
-  // non-pipelined mode. So by using free_req_release_weight we wait at least N times,
-  // where N is the number of connections in the thread.
-  ++free_req_release_weight;
-
-  if (free_req_release_weight > stats_->num_conns) {
-    free_req_release_weight = 0;
+  if (tl_pipe_cache_sz_tracker.CheckAndUpdateWatermark(pipeline_req_pool_.size())) {
     stats_->pipeline_cmd_cache_bytes -= pipeline_req_pool_.back()->StorageCapacity();
     pipeline_req_pool_.pop_back();
   }
@@ -1592,7 +1644,6 @@ Connection::PipelineMessagePtr Connection::GetFromPipelinePool() {
   if (pipeline_req_pool_.empty())
     return nullptr;
 
-  free_req_release_weight = 0;  // Reset the release weight.
   auto ptr = std::move(pipeline_req_pool_.back());
   stats_->pipeline_cmd_cache_bytes -= ptr->StorageCapacity();
   pipeline_req_pool_.pop_back();
@@ -1628,11 +1679,8 @@ bool Connection::Migrate(util::fb2::ProactorBase* dest) {
 
 Connection::WeakRef Connection::Borrow() {
   DCHECK(self_);
-  // If the connection is unaware of subscriptions, it could migrate threads, making this call
-  // unsafe. All external mechanisms that borrow references should register subscriptions.
-  DCHECK_GT(cc_->subscriptions, 0);
 
-  return WeakRef(self_, queue_backpressure_, socket_->proactor()->GetPoolIndex(), id_);
+  return WeakRef(self_, socket_->proactor()->GetPoolIndex(), id_);
 }
 
 void Connection::ShutdownThreadLocal() {
@@ -1709,7 +1757,8 @@ void Connection::SendAsync(MessageHandle msg) {
 
   msg.dispatch_ts = ProactorBase::GetMonotonicTimeNs();
   if (msg.IsPubMsg()) {
-    queue_backpressure_->subscriber_bytes.fetch_add(used_mem, memory_order_relaxed);
+    QueueBackpressure& qbp = GetQueueBackpressure();
+    qbp.subscriber_bytes.fetch_add(used_mem, memory_order_relaxed);
     stats_->dispatch_queue_subscriber_bytes += used_mem;
   }
 
@@ -1739,8 +1788,9 @@ void Connection::RecycleMessage(MessageHandle msg) {
   stats_->dispatch_queue_bytes -= used_mem;
   stats_->dispatch_queue_entries--;
 
+  QueueBackpressure& qbp = GetQueueBackpressure();
   if (msg.IsPubMsg()) {
-    queue_backpressure_->subscriber_bytes.fetch_sub(used_mem, memory_order_relaxed);
+    qbp.subscriber_bytes.fetch_sub(used_mem, memory_order_relaxed);
     stats_->dispatch_queue_subscriber_bytes -= used_mem;
   }
 
@@ -1752,7 +1802,7 @@ void Connection::RecycleMessage(MessageHandle msg) {
   // Retain pipeline message in pool.
   if (auto* pipe = get_if<PipelineMessagePtr>(&msg.handle); pipe) {
     pending_pipeline_cmd_cnt_--;
-    if (stats_->pipeline_cmd_cache_bytes < queue_backpressure_->pipeline_cache_limit) {
+    if (stats_->pipeline_cmd_cache_bytes < qbp.pipeline_cache_limit) {
       stats_->pipeline_cmd_cache_bytes += (*pipe)->StorageCapacity();
       pipeline_req_pool_.push_back(std::move(*pipe));
     }
@@ -1850,14 +1900,14 @@ void Connection::BreakOnce(uint32_t ev_mask) {
   }
 }
 
-void Connection::SetMaxQueueLenThreadLocal(uint32_t val) {
-  tl_queue_backpressure_.pipeline_queue_max_len = val;
-  tl_queue_backpressure_.pipeline_cnd.notify_all();
+void Connection::SetMaxQueueLenThreadLocal(unsigned tid, uint32_t val) {
+  thread_queue_backpressure[tid].pipeline_queue_max_len = val;
+  thread_queue_backpressure[tid].pipeline_cnd.notify_all();
 }
 
-void Connection::SetPipelineBufferLimit(size_t val) {
-  tl_queue_backpressure_.pipeline_buffer_limit = val;
-  tl_queue_backpressure_.pipeline_cnd.notify_all();
+void Connection::SetPipelineBufferLimit(unsigned tid, size_t val) {
+  thread_queue_backpressure[tid].pipeline_buffer_limit = val;
+  thread_queue_backpressure[tid].pipeline_cnd.notify_all();
 }
 
 void Connection::GetRequestSizeHistogramThreadLocal(std::string* hist) {
@@ -1874,18 +1924,23 @@ void Connection::TrackRequestSize(bool enable) {
   }
 }
 
-Connection::WeakRef::WeakRef(std::shared_ptr<Connection> ptr, QueueBackpressure* backpressure,
-                             unsigned thread, uint32_t client_id)
-    : ptr_{ptr}, backpressure_{backpressure}, thread_{thread}, client_id_{client_id} {
-  DCHECK(backpressure);
+void Connection::EnsureMemoryBudget(unsigned tid) {
+  thread_queue_backpressure[tid].EnsureBelowLimit();
+}
+
+Connection::WeakRef::WeakRef(std::shared_ptr<Connection> ptr, unsigned thread_id,
+                             uint32_t client_id)
+    : ptr_{ptr}, thread_id_{thread_id}, client_id_{client_id} {
 }
 
 unsigned Connection::WeakRef::Thread() const {
-  return thread_;
+  return thread_id_;
 }
 
 Connection* Connection::WeakRef::Get() const {
-  DCHECK_EQ(ProactorBase::me()->GetPoolIndex(), int(thread_));
+  // We should never access the connection object from other threads.
+  DCHECK_EQ(ProactorBase::me()->GetPoolIndex(), int(thread_id_));
+
   //  The connection can only be deleted on this thread, so
   //  this pointer is valid until the next suspension.
   //  Note: keeping a shared_ptr doesn't prolong the lifetime because
@@ -1899,17 +1954,6 @@ bool Connection::WeakRef::IsExpired() const {
 
 uint32_t Connection::WeakRef::GetClientId() const {
   return client_id_;
-}
-
-bool Connection::WeakRef::EnsureMemoryBudget() const {
-  // Simple optimization: If a connection was closed, don't check memory budget.
-  if (!ptr_.expired()) {
-    // We don't rely on the connection ptr staying valid because we only access
-    // the threads backpressure
-    backpressure_->EnsureBelowLimit();
-    return true;
-  }
-  return false;
 }
 
 bool Connection::WeakRef::operator<(const WeakRef& other) {
@@ -1931,7 +1975,6 @@ void ResetStats() {
   cstats.io_read_bytes = 0;
 
   tl_facade_stats->reply_stats = {};
-
   if (io_req_size_hist)
     io_req_size_hist->Clear();
 }

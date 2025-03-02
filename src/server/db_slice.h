@@ -229,7 +229,7 @@ class DbSlice {
     int32_t expire_options = 0;  // ExpireFlags
   };
 
-  DbSlice(uint32_t index, bool caching_mode, EngineShard* owner);
+  DbSlice(uint32_t index, bool cache_mode, EngineShard* owner);
   ~DbSlice();
 
   // Activates `db_ind` database if it does not exist (see ActivateDb below).
@@ -468,7 +468,24 @@ class DbSlice {
   }
 
   void TEST_EnableCacheMode() {
-    caching_mode_ = 1;
+    cache_mode_ = 1;
+  }
+
+  bool IsCacheMode() const {
+    // During loading time we never bump elements.
+    return cache_mode_ && (load_ref_count_ == 0);
+  }
+
+  void IncrLoadInProgress() {
+    ++load_ref_count_;
+  }
+
+  void DecrLoadInProgress() {
+    --load_ref_count_;
+  }
+
+  bool IsLoadRefCountZero() const {
+    return load_ref_count_ == 0;
   }
 
   // Test hook to inspect last locked keys.
@@ -512,6 +529,18 @@ class DbSlice {
   LocalBlockingCounter* BlockingCounter() {
     return &block_counter_;
   }
+
+  void StartSampleTopK(DbIndex db_ind, uint32_t min_freq);
+
+  struct SamplingResult {
+    std::vector<std::pair<std::string, uint64_t>> top_keys;  // key -> frequency pairs.
+  };
+  SamplingResult StopSampleTopK(DbIndex db_ind);
+
+  void StartSampleKeys(DbIndex db_ind);
+
+  // Returns number of unique keys sampled.
+  size_t StopSampleKeys(DbIndex db_ind);
 
  private:
   void PreUpdate(DbIndex db_ind, Iterator it, std::string_view key);
@@ -575,7 +604,7 @@ class DbSlice {
   mutable LocalBlockingCounter block_counter_;
 
   ShardId shard_id_;
-  uint8_t caching_mode_ : 1;
+  uint8_t cache_mode_ : 1;
 
   EngineShard* owner_;
 
@@ -588,6 +617,7 @@ class DbSlice {
   size_t soft_budget_limit_ = 0;
   size_t table_memory_ = 0;
   uint64_t entries_count_ = 0;
+  unsigned load_ref_count_ = 0;
 
   mutable SliceEvents events_;  // we may change this even for const operations.
 
@@ -647,23 +677,7 @@ class DbSlice {
                       absl::container_internal::hash_default_eq<std::string>, AllocatorType>
       client_tracking_map_;
 
-  class PrimeBumpPolicy {
-   public:
-    PrimeBumpPolicy(absl::flat_hash_set<uint64_t, FpHasher>* items) : fetched_items_(items) {
-    }
-
-    // returns true if we can change the object location in dash table.
-    bool CanBump(const CompactObj& obj) const {
-      if (obj.IsSticky()) {
-        return false;
-      }
-      auto hc = obj.HashCode();
-      return fetched_items_->insert(hc).second;
-    }
-
-   private:
-    mutable absl::flat_hash_set<uint64_t, FpHasher>* fetched_items_;
-  };
+  class PrimeBumpPolicy;
 };
 
 inline bool IsValid(const DbSlice::Iterator& it) {

@@ -343,7 +343,7 @@ OpResult<DbSlice::AddOrFindResult> SetJson(const OpArgs& op_args, string_view ke
   std::optional<JsonType> parsed_json = ShardJsonFromString(json_str);
   if (!parsed_json) {
     VLOG(1) << "got invalid JSON string '" << json_str << "' cannot be saved";
-    return OpStatus::INVALID_VALUE;
+    return OpStatus::INVALID_JSON;
   }
 
   if (JsonEnconding() == kEncodingJsonFlat) {
@@ -955,8 +955,8 @@ OpResult<long> OpDel(const OpArgs& op_args, string_view key, string_view path,
 
   if (json_path.HoldsJsonPath()) {
     const json::Path& path = json_path.AsJsonPath();
-    long deletions =
-        json::MutatePath(path, [](optional<string_view>, JsonType* val) { return true; }, json_val);
+    long deletions = json::MutatePath(
+        path, [](optional<string_view>, JsonType* val) { return true; }, json_val);
     return deletions;
   }
 
@@ -1345,7 +1345,7 @@ OpResult<bool> OpSet(const OpArgs& op_args, string_view key, string_view path,
   optional<JsonType> parsed_json = ShardJsonFromString(json_str);
   if (!parsed_json) {
     VLOG(1) << "got invalid JSON string '" << json_str << "' cannot be saved";
-    return OpStatus::INVALID_VALUE;
+    return OpStatus::INVALID_JSON;
   }
   const JsonType& new_json = parsed_json.value();
 
@@ -1444,7 +1444,7 @@ OpStatus OpMerge(const OpArgs& op_args, string_view key, string_view path,
   std::optional<JsonType> parsed_json = ShardJsonFromString(json_str);
   if (!parsed_json) {
     VLOG(1) << "got invalid JSON string '" << json_str << "' cannot be saved";
-    return OpStatus::SYNTAX_ERR;
+    return OpStatus::INVALID_JSON;
   }
 
   auto cb = [&](std::optional<std::string_view> cur_path, JsonType* val) -> MutateCallbackResult<> {
@@ -1487,7 +1487,8 @@ void JsonFamily::Set(CmdArgList args, const CommandContext& cmd_cntx) {
   if (parser.Error() || parser.HasNext())  // also clear the parser error dcheck
     return builder->SendError(kSyntaxErr);
 
-  auto cb = [&](Transaction* t, EngineShard* shard) {
+  auto cb = [&, &key = key, &path = path, &json_str = json_str](Transaction* t,
+                                                                EngineShard* shard) {
     return OpSet(t->GetOpArgs(shard), key, path, json_path, json_str, is_nx_condition,
                  is_xx_condition);
   };

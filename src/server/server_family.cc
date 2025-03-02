@@ -230,7 +230,7 @@ using strings::HumanReadableNumBytes;
 
 namespace {
 
-const auto kRedisVersion = "7.2.0";
+const auto kRedisVersion = "7.4.0";
 
 using EngineFunc = void (ServerFamily::*)(CmdArgList args, const CommandContext&);
 
@@ -870,7 +870,6 @@ void ServerFamily::Init(util::AcceptServer* acceptor, std::vector<facade::Listen
   config_registry.RegisterMutable("tls_ca_cert_dir");
   config_registry.RegisterMutable("replica_priority");
   config_registry.RegisterMutable("lua_undeclared_keys_shas");
-  config_registry.RegisterMutable("list_rdb_encode_v2");
 
   pb_task_ = shard_set->pool()->GetNextProactor();
   if (pb_task_->GetKind() == ProactorBase::EPOLL) {
@@ -1519,6 +1518,15 @@ void PrintPrometheusMetrics(uint64_t uptime, const Metrics& m, DflyCmd* dfly_cmd
       absl::StrAppend(&resp->body(), str);
   }
 
+  if (IsClusterEnabled()) {
+    string str;
+    AppendMetricHeader("migration_errors_total", "Total error numbers of current migrations",
+                       MetricType::GAUGE, &str);
+    AppendMetricValue("migration_errors_total", m.migration_errors_total, {"num"},
+                      {"migration errors"}, &str);
+    absl::StrAppend(&resp->body(), str);
+  }
+
   string db_key_metrics;
   string db_key_expire_metrics;
 
@@ -1773,8 +1781,9 @@ void ServerFamily::CancelBlockingOnThread(std::function<OpStatus(ArgSlice)> stat
     }
   };
 
-  for (auto* listener : listeners_)
-    listener->TraverseConnectionsOnThread(cb);
+  for (auto* listener : listeners_) {
+    listener->TraverseConnectionsOnThread(cb, UINT32_MAX, nullptr);
+  }
 }
 
 string GetPassword() {
@@ -2201,6 +2210,8 @@ Metrics ServerFamily::GetMetrics(Namespace* ns) const {
     result.loading_stats = loading_stats_;
   }
 
+  result.migration_errors_total = service_.cluster_family().MigrationsErrorsCount();
+
   // Update peak stats. We rely on the fact that GetMetrics is called frequently enough to
   // update peak_stats_ from it.
   util::fb2::LockGuard lk{peak_stats_mu_};
@@ -2219,17 +2230,8 @@ Metrics ServerFamily::GetMetrics(Namespace* ns) const {
   return result;
 }
 
-void ServerFamily::Info(CmdArgList args, const CommandContext& cmd_cntx) {
-  if (args.size() > 1) {
-    return cmd_cntx.rb->SendError(kSyntaxErr);
-  }
-
-  string section;
-
-  if (args.size() == 1) {
-    section = absl::AsciiStrToUpper(ArgS(args, 0));
-  }
-
+string ServerFamily::FormatInfoMetrics(const Metrics& m, std::string_view section,
+                                       bool priveleged) const {
   string info;
 
   auto should_enter = [&](string_view name, bool hidden = false) {
@@ -2245,13 +2247,13 @@ void ServerFamily::Info(CmdArgList args, const CommandContext& cmd_cntx) {
     absl::StrAppend(&info, a1, ":", a2, "\r\n");
   };
 
-  ServerState* ss = ServerState::tlocal();
-
-  bool show_managed_info =
-      !absl::GetFlag(FLAGS_managed_service_info) || cmd_cntx.conn_cntx->conn()->IsPrivileged();
+  bool show_managed_info = priveleged || !absl::GetFlag(FLAGS_managed_service_info);
 
   if (should_enter("SERVER")) {
-    auto kind = ProactorBase::me()->GetKind();
+    ProactorBase* proactor = ProactorBase::me();
+
+    // proactor might be null in tests.
+    auto kind = proactor ? ProactorBase::me()->GetKind() : ProactorBase::EPOLL;
     const char* multiplex_api = (kind == ProactorBase::IOURING) ? "iouring" : "epoll";
 
     append("redis_version", kRedisVersion);
@@ -2271,12 +2273,6 @@ void ServerFamily::Info(CmdArgList args, const CommandContext& cmd_cntx) {
     append("uptime_in_days", uptime / (3600 * 24));
   }
 
-  Metrics m;
-  // Save time by not calculating metrics if we don't need them.
-  if (!(section == "SERVER" || section == "REPLICATION")) {
-    m = GetMetrics(cmd_cntx.conn_cntx->ns);
-  }
-
   DbStats total;
   for (const auto& db_stats : m.db_stats)
     total += db_stats;
@@ -2289,6 +2285,7 @@ void ServerFamily::Info(CmdArgList args, const CommandContext& cmd_cntx) {
     append("pipeline_queue_length", m.facade_stats.conn_stats.dispatch_queue_entries);
 
     append("send_delay_ms", GetDelayMs(m.oldest_pending_send_ts));
+    append("timeout_disconnects", m.coordinator_stats.conn_timeout_events);
   }
 
   if (should_enter("MEMORY")) {
@@ -2328,8 +2325,6 @@ void ServerFamily::Info(CmdArgList args, const CommandContext& cmd_cntx) {
     append("num_buckets", total.bucket_count);
     append("num_entries", total.key_count);
     append("inline_keys", total.inline_keys);
-    append("listpack_blobs", total.listpack_blob_cnt);
-    append("listpack_bytes", total.listpack_bytes);
     append("small_string_bytes", m.small_string_bytes);
     append("pipeline_cache_bytes", m.facade_stats.conn_stats.pipeline_cmd_cache_bytes);
     append("dispatch_queue_bytes", m.facade_stats.conn_stats.dispatch_queue_bytes);
@@ -2476,7 +2471,10 @@ void ServerFamily::Info(CmdArgList args, const CommandContext& cmd_cntx) {
     append("last_saved_file", save_info.file_name);
     append("last_success_save_duration_sec", save_info.success_duration_sec);
 
-    unsigned is_loading = (ss->gstate() == GlobalState::LOADING);
+    ServerState* ss = ServerState::tlocal();
+
+    // ss can be null in tests.
+    unsigned is_loading = ss && (ss->gstate() == GlobalState::LOADING);
     append("loading", is_loading);
     append("saving", is_saving);
     append("current_save_duration_sec", curent_durration_sec);
@@ -2641,7 +2639,32 @@ void ServerFamily::Info(CmdArgList args, const CommandContext& cmd_cntx) {
 
   if (should_enter("CLUSTER")) {
     append("cluster_enabled", IsClusterEnabledOrEmulated());
+    append("migration_errors_total", service_.cluster_family().MigrationsErrorsCount());
   }
+
+  return info;
+}
+
+void ServerFamily::Info(CmdArgList args, const CommandContext& cmd_cntx) {
+  if (args.size() > 1) {
+    return cmd_cntx.rb->SendError(kSyntaxErr);
+  }
+
+  string section;
+
+  if (args.size() == 1) {
+    section = absl::AsciiStrToUpper(ArgS(args, 0));
+  }
+
+  Metrics metrics;
+
+  // Save time by not calculating metrics if we don't need them.
+  if (!(section == "SERVER" || section == "REPLICATION")) {
+    metrics = GetMetrics(cmd_cntx.conn_cntx->ns);
+  }
+
+  string info = FormatInfoMetrics(metrics, section, cmd_cntx.conn_cntx->conn()->IsPrivileged());
+
   auto* rb = static_cast<RedisReplyBuilder*>(cmd_cntx.rb);
   rb->SendVerbatimString(info);
 }
@@ -2748,10 +2771,14 @@ void ServerFamily::AddReplicaOf(CmdArgList args, const CommandContext& cmd_cntx)
 
   auto add_replica = make_unique<Replica>(replicaof_args->host, replicaof_args->port, &service_,
                                           master_replid(), replicaof_args->slot_range);
-  error_code ec = add_replica->Start(cmd_cntx.rb);
-  if (!ec) {
-    cluster_replicas_.push_back(std::move(add_replica));
+  GenericError ec = add_replica->Start();
+  if (ec) {
+    cmd_cntx.rb->SendError(ec.Format());
+    return;
   }
+  add_replica->StartMainReplicationFiber();
+  cluster_replicas_.push_back(std::move(add_replica));
+  cmd_cntx.rb->SendOk();
 }
 
 void ServerFamily::ReplicaOfInternal(CmdArgList args, Transaction* tx, SinkReplyBuilder* builder,
@@ -2805,13 +2832,7 @@ void ServerFamily::ReplicaOfInternal(CmdArgList args, Transaction* tx, SinkReply
       return;
     }
 
-    // If we are called by "Replicate", tx will be null but we do not need
-    // to flush anything.
-    if (tx) {
-      Drakarys(tx, DbSlice::kDbAll);
-    }
-
-    // Create a new replica and assing it
+    // Create a new replica and assign it
     new_replica = make_shared<Replica>(replicaof_args->host, replicaof_args->port, &service_,
                                        master_replid(), replicaof_args->slot_range);
 
@@ -2824,12 +2845,12 @@ void ServerFamily::ReplicaOfInternal(CmdArgList args, Transaction* tx, SinkReply
   // We proceed connecting below without the lock to allow interrupting the replica immediately.
   // From this point and onward, it should be highly responsive.
 
-  error_code ec{};
+  GenericError ec{};
   switch (on_err) {
     case ActionOnConnectionFail::kReturnOnError:
-      ec = new_replica->Start(builder);
+      ec = new_replica->Start();
       break;
-    case ActionOnConnectionFail::kContinueReplication:  // set DF to replicate, and forget about it
+    case ActionOnConnectionFail::kContinueReplication:
       new_replica->EnableReplication(builder);
       break;
   };
@@ -2837,11 +2858,28 @@ void ServerFamily::ReplicaOfInternal(CmdArgList args, Transaction* tx, SinkReply
   // If the replication attempt failed, clean up global state. The replica should have stopped
   // internally.
   util::fb2::LockGuard lk(replicaof_mu_);  // Only one REPLICAOF command can run at a time
-  if (ec && replica_ == new_replica) {
-    service_.SwitchState(GlobalState::LOADING, GlobalState::ACTIVE);
-    SetMasterFlagOnAllThreads(true);
-    replica_.reset();
+  // If there was an error above during Start we must not start the main replication fiber.
+  // However, it could be the case that Start() above connected succefully and by the time
+  // we acquire the lock, the context got cancelled because another ReplicaOf command
+  // executed and acquired the replicaof_mu_ before us.
+  const bool cancelled = new_replica->IsContextCancelled();
+  if (ec || cancelled) {
+    if (replica_ == new_replica) {
+      service_.SwitchState(GlobalState::LOADING, GlobalState::ACTIVE);
+      SetMasterFlagOnAllThreads(true);
+      replica_.reset();
+    }
+    builder->SendError(ec ? ec.Format() : "replication cancelled");
+    return;
   }
+  // Successfully connected now we flush
+  // If we are called by "Replicate", tx will be null but we do not need
+  // to flush anything.
+  if (on_err == ActionOnConnectionFail::kReturnOnError) {
+    Drakarys(tx, DbSlice::kDbAll);
+    new_replica->StartMainReplicationFiber();
+  }
+  builder->SendOk();
 }
 
 void ServerFamily::StopAllClusterReplicas() {

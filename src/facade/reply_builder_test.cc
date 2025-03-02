@@ -195,7 +195,7 @@ RedisReplyBuilderTest::ParsingResults RedisReplyBuilderTest::Parse() {
   parser_buffer_.reset(new uint8_t[SinkSize()]);
   auto* ptr = parser_buffer_.get();
   memcpy(ptr, str().data(), SinkSize());
-  RedisParser parser(UINT32_MAX, false);  // client side
+  RedisParser parser(RedisParser::Mode::CLIENT);
   result.result =
       parser.Parse(RedisParser::Buffer{ptr, SinkSize()}, &result.consumed, &result.args);
   return result;
@@ -915,6 +915,23 @@ TEST_F(RedisReplyBuilderTest, Issue3449) {
   ParsingResults parse_result = Parse();
   ASSERT_FALSE(parse_result.IsError());
   EXPECT_EQ(10000, parse_result.args.size());
+}
+
+TEST_F(RedisReplyBuilderTest, Issue4424) {
+  vector<string> records;
+  for (unsigned i = 0; i < 800; ++i) {
+    records.push_back(string(100, 'a'));
+  }
+
+  for (unsigned j = 0; j < 2; ++j) {
+    builder_->SendBulkStrArr(records);
+    ASSERT_TRUE(NoErrors());
+    ParsingResults parse_result = Parse();
+    ASSERT_FALSE(parse_result.IsError()) << int(parse_result.result);
+    ASSERT_TRUE(parse_result.Verify(SinkSize()));
+    EXPECT_EQ(800, parse_result.args.size());
+    sink_.Clear();
+  }
 }
 
 static void BM_FormatDouble(benchmark::State& state) {

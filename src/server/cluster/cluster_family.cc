@@ -15,6 +15,7 @@
 #include "facade/dragonfly_connection.h"
 #include "facade/error.h"
 #include "server/acl/acl_commands_def.h"
+#include "server/channel_store.h"
 #include "server/command_registry.h"
 #include "server/conn_context.h"
 #include "server/dflycmd.h"
@@ -506,6 +507,10 @@ void DeleteSlots(const SlotRanges& slots_ranges) {
     namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id()).FlushSlots(slots_ranges);
   };
   shard_set->pool()->AwaitFiberOnAll(std::move(cb));
+
+  auto* channel_store = ServerState::tlocal()->channel_store();
+  auto deleted = SlotSet(slots_ranges);
+  channel_store->UnsubscribeAfterClusterSlotMigration(deleted);
 }
 
 void WriteFlushSlotsToJournal(const SlotRanges& slot_ranges) {
@@ -896,11 +901,12 @@ void ClusterFamily::InitMigration(CmdArgList args, SinkReplyBuilder* builder) {
   if (auto err = parser.Error(); err)
     return builder->SendError(err->MakeReply());
 
+  SlotRanges slot_ranges(std::move(slots));
+
   const auto& incoming_migrations = cluster_config()->GetIncomingMigrations();
   bool found = any_of(incoming_migrations.begin(), incoming_migrations.end(),
-                      [source_id = source_id](const MigrationInfo& info) {
-                        // TODO: also compare slot ranges (in an order-agnostic way)
-                        return info.node_info.id == source_id;
+                      [source_id = source_id, &slot_ranges](const MigrationInfo& info) {
+                        return info.node_info.id == source_id && info.slot_ranges == slot_ranges;
                       });
   if (!found) {
     VLOG(1) << "Unrecognized incoming migration from " << source_id;
@@ -914,7 +920,7 @@ void ClusterFamily::InitMigration(CmdArgList args, SinkReplyBuilder* builder) {
   LOG_IF(WARNING, was_removed) << "Reinit issued for migration from:" << source_id;
 
   incoming_migrations_jobs_.emplace_back(make_shared<IncomingSlotMigration>(
-      string(source_id), &server_family_->service(), SlotRanges(std::move(slots)), flows_num));
+      string(source_id), &server_family_->service(), std::move(slot_ranges), flows_num));
 
   return builder->SendOk();
 }
@@ -966,16 +972,17 @@ void ClusterFamily::ApplyMigrationSlotRangeToConfig(std::string_view node_id,
   bool is_migration_valid = false;
   if (is_incoming) {
     for (const auto& mj : incoming_migrations_jobs_) {
-      if (mj->GetSourceID() == node_id) {
-        // TODO add compare for slots
+      if (mj->GetSourceID() == node_id && slots == mj->GetSlots()) {
         is_migration_valid = true;
+        break;
       }
     }
   } else {
     for (const auto& mj : outgoing_migration_jobs_) {
-      if (mj->GetMigrationInfo().node_info.id == node_id) {
-        // TODO add compare for slots
+      if (mj->GetMigrationInfo().node_info.id == node_id &&
+          mj->GetMigrationInfo().slot_ranges == slots) {
         is_migration_valid = true;
+        break;
       }
     }
   }
@@ -1034,6 +1041,22 @@ void ClusterFamily::PauseAllIncomingMigrations(bool pause) {
   for (auto& im : incoming_migrations_jobs_) {
     im->Pause(pause);
   }
+}
+
+size_t ClusterFamily::MigrationsErrorsCount() const {
+  util::fb2::LockGuard lk(migration_mu_);
+
+  size_t error_num = 0;
+
+  for (const auto& mj : incoming_migrations_jobs_) {
+    error_num += mj->GetErrorsCount();
+  }
+
+  for (const auto& mj : outgoing_migration_jobs_) {
+    error_num += mj->GetErrorsCount();
+  }
+
+  return error_num;
 }
 
 using EngineFunc = void (ClusterFamily::*)(CmdArgList args, const CommandContext& cmd_cntx);

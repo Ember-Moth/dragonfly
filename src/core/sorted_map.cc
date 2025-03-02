@@ -4,6 +4,8 @@
 
 #include "core/sorted_map.h"
 
+#include <absl/strings/str_cat.h>
+
 #include <cmath>
 
 extern "C" {
@@ -20,8 +22,6 @@ extern "C" {
 #include "base/logging.h"
 
 using namespace std;
-
-ABSL_RETIRED_FLAG(bool, use_zset_tree, true, "If true use b+tree for zset implementation");
 
 namespace dfly {
 namespace detail {
@@ -233,21 +233,27 @@ int SortedMap::ScoreSdsPolicy::KeyCompareTo::operator()(ScoreSds a, ScoreSds b) 
   return sdscmp(sdsa, sdsb);
 }
 
-int SortedMap::Add(double score, sds ele, int in_flags, int* out_flags, double* newscore) {
+int SortedMap::AddElem(double score, std::string_view ele, int in_flags, int* out_flags,
+                       double* newscore) {
   // does not take ownership over ele.
   DCHECK(!isnan(score));
 
-  // TODO: to introduce AddOrFind in score_map.
-  ScoreSds obj = score_map->FindObj(ele);
+  ScoreSds obj = nullptr;
+  bool added = false;
 
-  if (obj == nullptr) {
-    // Adding a new element.
-    if (in_flags & ZADD_IN_XX) {
+  if (in_flags & ZADD_IN_XX) {
+    obj = score_map->FindObj(ele);
+    if (obj == nullptr) {
       *out_flags = ZADD_OUT_NOP;
       return 1;
     }
+  } else {
+    tie(obj, added) = score_map->AddOrSkip(ele, score);
+  }
 
-    obj = score_map->AddUnique(string_view{ele, sdslen(ele)}, score);
+  if (added) {
+    // Adding a new element.
+    DCHECK_EQ(in_flags & ZADD_IN_XX, 0);
 
     *out_flags = ZADD_OUT_ADDED;
     *newscore = score;
@@ -290,21 +296,19 @@ optional<double> SortedMap::GetScore(sds ele) const {
   return std::nullopt;
 }
 
-// Takes ownership over ele.
-bool SortedMap::Insert(double score, sds ele) {
-  DVLOG(1) << "Inserting " << ele << " with score " << score;
+bool SortedMap::InsertNew(double score, std::string_view member) {
+  DVLOG(2) << "InsertNew " << score << " " << member;
 
-  auto [newk, added] = score_map->AddOrUpdate(string_view{ele, sdslen(ele)}, score);
-  DCHECK(added);
+  auto [newk, added] = score_map->AddOrSkip(member, score);
+  if (!added)
+    return false;
 
   added = score_tree->Insert(newk);
-  DCHECK(added);
-  sdsfree(ele);
-
+  CHECK(added);
   return true;
 }
 
-optional<unsigned> SortedMap::GetRank(sds ele, bool reverse) const {
+optional<unsigned> SortedMap::GetRank(std::string_view ele, bool reverse) const {
   ScoreSds obj = score_map->FindObj(ele);
   if (obj == nullptr)
     return std::nullopt;
@@ -743,7 +747,6 @@ SortedMap* SortedMap::FromListPack(PMR_NS::memory_resource* res, const uint8_t* 
   unsigned char* vstr;
   unsigned int vlen;
   long long vlong;
-  sds ele;
 
   void* ptr = res->allocate(sizeof(SortedMap), alignof(SortedMap));
   SortedMap* zs = new (ptr) SortedMap{res};
@@ -757,12 +760,12 @@ SortedMap* SortedMap::FromListPack(PMR_NS::memory_resource* res, const uint8_t* 
   while (eptr != NULL) {
     double score = zzlGetScore(sptr);
     vstr = lpGetValue(eptr, &vlen, &vlong);
-    if (vstr == NULL)
-      ele = sdsfromlonglong(vlong);
-    else
-      ele = sdsnewlen((char*)vstr, vlen);
+    if (vstr == NULL) {
+      CHECK(zs->InsertNew(score, absl::StrCat(vlong)));
+    } else {
+      CHECK(zs->InsertNew(score, string_view{reinterpret_cast<const char*>(vstr), vlen}));
+    }
 
-    CHECK(zs->Insert(score, ele));
     zzlNext(zl, &eptr, &sptr);
   }
 
@@ -780,7 +783,8 @@ bool SortedMap::DefragIfNeeded(float ratio) {
   return reallocated;
 }
 
-std::optional<SortedMap::RankAndScore> SortedMap::GetRankAndScore(sds ele, bool reverse) const {
+std::optional<SortedMap::RankAndScore> SortedMap::GetRankAndScore(std::string_view ele,
+                                                                  bool reverse) const {
   ScoreSds obj = score_map->FindObj(ele);
   if (obj == nullptr)
     return std::nullopt;

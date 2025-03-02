@@ -3,6 +3,7 @@
 //
 #include "facade/redis_parser.h"
 
+#include <absl/flags/flag.h>
 #include <absl/strings/escaping.h>
 #include <absl/strings/numbers.h>
 
@@ -12,7 +13,6 @@
 namespace facade {
 
 using namespace std;
-constexpr static long kMaxBulkLen = 256 * (1ul << 20);  // 256MB.
 
 auto RedisParser::Parse(Buffer str, uint32_t* consumed, RespExpr::Vec* res) -> Result {
   DCHECK(!str.empty());
@@ -232,8 +232,12 @@ auto RedisParser::ParseInline(Buffer str) -> ResultConsumed {
   }
 
   uint32_t last_consumed = ptr - str.data();
-  if (ptr == end) {                   // we have not finished parsing.
-    is_broken_token_ = ptr[-1] > 32;  // we stopped in the middle of the token.
+  if (ptr == end) {  // we have not finished parsing.
+    if (cached_expr_->empty()) {
+      state_ = CMD_COMPLETE_S;  // have not found anything besides whitespace.
+    } else {
+      is_broken_token_ = ptr[-1] > 32;  // we stopped in the middle of the token.
+    }
     return {INPUT_PENDING, last_consumed};
   }
 
@@ -359,13 +363,18 @@ auto RedisParser::ParseArg(Buffer str) -> ResultConsumed {
       return res;
     }
 
+    if (len > 0 && static_cast<uint64_t>(len) > max_bulk_len_) {
+      LOG_EVERY_T(WARNING, 1) << "Threshold reached with bulk len: " << len
+                              << ", consider increasing max_bulk_len";
+      return {BAD_ARRAYLEN, res.second};
+    }
+
     if (len == -1) {  // Resp2 NIL
       cached_expr_->emplace_back(RespExpr::NIL);
       cached_expr_->back().u = Buffer{};
       HandleFinishArg();
     } else {
       DVLOG(1) << "String(" << len << ")";
-      LOG_IF(WARNING, len > kMaxBulkLen) << "Large bulk len: " << len;
 
       cached_expr_->emplace_back(RespExpr::STRING);
       cached_expr_->back().u = Buffer{};

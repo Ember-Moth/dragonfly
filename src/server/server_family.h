@@ -125,6 +125,8 @@ struct Metrics {
   // Replica reconnect stats on the replica side. Undefined for master
   std::optional<ReplicaInfo> replica_side_info;
 
+  size_t migration_errors_total;
+
   LoadingStats loading_stats;
 };
 
@@ -177,6 +179,9 @@ class ServerFamily {
   void ResetStat(Namespace* ns);
 
   Metrics GetMetrics(Namespace* ns) const;
+
+  std::string FormatInfoMetrics(const Metrics& metrics, std::string_view section,
+                                bool priveleged) const;
 
   ScriptMgr* script_mgr() {
     return script_mgr_.get();

@@ -42,14 +42,6 @@ class RdbTest : public BaseFamilyTest {
  protected:
   void SetUp();
 
-  static void SetUpTestSuite() {
-    static bool init = true;
-    if (exchange(init, false)) {
-      fb2::SetDefaultStackResource(&fb2::std_malloc_resource, 32_KB);
-    }
-    BaseFamilyTest::SetUpTestSuite();
-  }
-
   io::FileSource GetSource(string name);
 
   std::error_code LoadRdb(const string& filename) {
@@ -63,9 +55,10 @@ class RdbTest : public BaseFamilyTest {
 };
 
 void RdbTest::SetUp() {
+  // Setting max_memory_limit must be before calling  InitWithDbFilename
+  max_memory_limit = 40000000;
   InitWithDbFilename();
   CHECK_EQ(zmalloc_used_memory_tl, 0);
-  max_memory_limit = 40000000;
 }
 
 inline const uint8_t* to_byte(const void* s) {
@@ -728,6 +721,33 @@ TEST_F(RdbTest, SnapshotTooBig) {
   used_mem_current = 1000000;
   auto resp = Run({"debug", "reload"});
   ASSERT_THAT(resp, ErrArg("Out of memory"));
+}
+
+TEST_F(RdbTest, HugeKeyIssue4497) {
+  SetTestFlag("cache_mode", "true");
+  ResetService();
+
+  EXPECT_EQ(Run({"flushall"}), "OK");
+  EXPECT_EQ(Run({"debug", "populate", "1", "k", "1000", "rand", "type", "set", "elements", "5000"}),
+            "OK");
+  EXPECT_EQ(Run({"save", "rdb", "hugekey.rdb"}), "OK");
+  EXPECT_EQ(Run({"dfly", "load", "hugekey.rdb"}), "OK");
+  EXPECT_EQ(Run({"flushall"}), "OK");
+}
+
+TEST_F(RdbTest, HugeKeyIssue4554) {
+  SetTestFlag("cache_mode", "true");
+  // We need to stress one flow/shard such that the others finish early. Lock on hashtags allows
+  // that.
+  SetTestFlag("lock_on_hashtags", "true");
+  ResetService();
+
+  EXPECT_EQ(
+      Run({"debug", "populate", "20", "{tmp}", "20", "rand", "type", "set", "elements", "10000"}),
+      "OK");
+  EXPECT_EQ(Run({"save", "df", "hugekey"}), "OK");
+  EXPECT_EQ(Run({"dfly", "load", "hugekey-summary.dfs"}), "OK");
+  EXPECT_EQ(Run({"flushall"}), "OK");
 }
 
 }  // namespace dfly

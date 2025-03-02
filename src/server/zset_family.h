@@ -19,7 +19,7 @@ namespace dfly {
 class CommandRegistry;
 struct CommandContext;
 class Transaction;
-class OpArgs;
+struct OpArgs;
 
 class ZSetFamily {
  public:
@@ -106,6 +106,7 @@ class ZSetFamily {
   static void ZCard(CmdArgList args, const CommandContext& cmd_cntx);
   static void ZCount(CmdArgList args, const CommandContext& cmd_cntx);
   static void ZDiff(CmdArgList args, const CommandContext& cmd_cntx);
+  static void ZDiffStore(CmdArgList args, const CommandContext& cmd_cntx);
   static void ZIncrBy(CmdArgList args, const CommandContext& cmd_cntx);
   static void ZInterStore(CmdArgList args, const CommandContext& cmd_cntx);
   static void ZInter(CmdArgList args, const CommandContext& cmd_cntx);

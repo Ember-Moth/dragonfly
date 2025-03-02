@@ -37,7 +37,7 @@ constexpr size_t kMinBlobSize = 32_KB;
 }  // namespace
 
 SliceSnapshot::SliceSnapshot(CompressionMode compression_mode, DbSlice* slice,
-                             SnapshotDataConsumerInterface* consumer, Context* cntx)
+                             SnapshotDataConsumerInterface* consumer, ExecutionState* cntx)
     : db_slice_(slice),
       db_array_(slice->databases()),
       compression_mode_(compression_mode),
@@ -158,7 +158,7 @@ void SliceSnapshot::IterateBucketsFb(bool send_full_sync_cut) {
   }
 
   for (DbIndex db_indx = 0; db_indx < db_array_.size(); ++db_indx) {
-    if (cntx_->IsCancelled())
+    if (!cntx_->IsRunning())
       return;
 
     if (!db_array_[db_indx])
@@ -169,7 +169,7 @@ void SliceSnapshot::IterateBucketsFb(bool send_full_sync_cut) {
 
     VLOG(1) << "Start traversing " << pt->size() << " items for index " << db_indx;
     do {
-      if (cntx_->IsCancelled()) {
+      if (!cntx_->IsRunning()) {
         return;
       }
 
@@ -213,7 +213,7 @@ void SliceSnapshot::SwitchIncrementalFb(LSN lsn) {
   VLOG(1) << "Starting incremental snapshot from lsn=" << lsn;
 
   // The replica sends the LSN of the next entry is wants to receive.
-  while (!cntx_->IsCancelled() && journal->IsLSNInBuffer(lsn)) {
+  while (cntx_->IsRunning() && journal->IsLSNInBuffer(lsn)) {
     serializer_->WriteJournalEntry(journal->GetEntry(lsn));
     PushSerialized(false);
     lsn++;
@@ -291,11 +291,10 @@ unsigned SliceSnapshot::SerializeBucket(DbIndex db_index, PrimeTable::bucket_ite
   it.SetVersion(snapshot_version_);
   unsigned result = 0;
 
-  while (!it.is_done()) {
+  for (it.AdvanceIfNotOccupied(); !it.is_done(); ++it) {
     ++result;
     // might preempt due to big value serialization.
     SerializeEntry(db_index, it->first, it->second);
-    ++it;
   }
   serialize_bucket_running_ = false;
   return result;
@@ -391,7 +390,7 @@ void SliceSnapshot::OnDbChange(DbIndex db_index, const DbSlice::ChangeReq& req) 
   const PrimeTable::bucket_iterator* bit = req.update();
 
   if (bit) {
-    if (bit->GetVersion() < snapshot_version_) {
+    if (!bit->is_done() && bit->GetVersion() < snapshot_version_) {
       stats_.side_saved += SerializeBucket(db_index, *bit);
     }
   } else {
